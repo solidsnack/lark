@@ -15,16 +15,37 @@ class Lark
     end
   end
 
-  def self.redis_pool
-    @redis_pool ||= urls.map do |url| 
+  def self.dbs
+    @dbs ||= urls.map do |url|
       puts "Connecting to #{url}";
       Redis.connect(:url => url)
     end
-    @redis_pool.push @redis_pool.shift
   end
 
-  def redis_pool
-    self.class.redis_pool
+  ## all the black magic happens here
+  ## pool runs the block against all the db's
+  ## throws an error if non of them are online
+  ## and returns an array of the block results
+  ## from the ones who are online
+
+  def self.pool(&blk)
+    dbs.push dbs.shift
+
+    num_errors = 0
+    results = []
+    begin
+      dbs.each do |db|
+        begin
+          results << blk.call(db)
+        rescue Errno::ECONNREFUSED, Timeout::Error => e
+          puts "#{e.class}: #{e.message}"
+          num_errors += 1
+        end
+      end
+    ensure
+      raise LarkDBOffline if num_errors == dbs.size
+    end
+    results
   end
 
   def self.on_expired(&blk)
@@ -39,42 +60,17 @@ class Lark
     @id = _id
     @options = options
     @domain = options[:domain]
-    @expire = options[:expire] 
-  end
-
-  def safe_access(&blk)
-    blk.call();
-    rescue Errno::ECONNREFUSED
-      puts "CON REFUSTED"
-    rescue Timeout::Error
-      puts "TIMEOUT"
+    @expire = options[:expire]
   end
 
   def load_data
-    ## try each redis - return when one works without an error
+    ## try each db - return when one works without an error
     ## throw an error if all are down
-    data = nil
-    redis_pool.each do |redis|
-      safe_access do
-        data = redis.hgetall(key)
-        return data unless data.empty?
-      end
+    pool do |db|
+      data = db.hgetall(key)
+      return data if not data.empty?
     end
-    raise LarkDBOffline if data.nil?
-    data
-  end
-
-  def all_redis(&blk)
-    ## try all redis - throw an error if none of them worked
-    ## return an array of all the results
-    results = []
-    redis_pool.each do |redis|
-      safe_access do
-        results << blk.call(redis)
-      end
-    end
-    raise LarkDBOffline if results.empty?
-    results
+    {}
   end
 
   def key
@@ -94,11 +90,11 @@ class Lark
     data[:created_on] ||= Time.new.to_i
     data[:domain] ||= @domain
     data[:updated_on] = Time.new.to_i
-    all_redis do |redis|
-      redis.multi do
-        redis.hmset *[ key, data.to_a ].flatten
-        redis.expire key, @expire if @expire
-        redis.sadd set_key, @id
+    pool do |db|
+      db.multi do
+        db.hmset *[ key, data.to_a ].flatten
+        db.expire key, @expire if @expire
+        db.sadd set_key, @id
       end
     end
   end
@@ -107,37 +103,30 @@ class Lark
     @data ||= load_data
   end
 
-  def valid?
-    if data.empty?
-      destroy
-      false
-    else
-      true
-    end
-  end
-
   def destroy
-    all_redis do |redis|
-      redis.multi do
-        redis.del key
-        redis.srem set_key, id
+    pool do |db|
+      db.multi do
+        db.del key
+        db.srem set_key, id
       end
     end
     self.class.expired.call(id, @domain);
   end
 
   def all_ids
-    all_redis { |redis| redis.smembers(set_key) }.flatten.uniq
+    pool { |db| db.smembers(set_key) }.flatten.uniq.sort
   end
 
   def find_ids(match)
-    a = all_ids.select { |_id| match.match(_id) }
-    puts "find_ids #{a.inspect}"
-    a
+    all_ids.select { |_id| match.match(_id) }
   end
 
   def find_valid(match)
-    find_ids(match).map { |_id| Lark.new(_id, @options) }.select { |l| l.valid? }
+    all = find_ids(match).map { |_id| Lark.new(_id, @options) }
+    valid = all.reject { |l| l.data.empty? }
+    invalid = all - valid
+    invalid.each { |i| i.destroy }
+    valid
   end
 
   def find(match = //)
@@ -145,4 +134,9 @@ class Lark
     find_valid(match).each { |v| result[v.id] = v.data }
     result
   end
+
+  def pool(&blk)
+    self.class.pool(&blk)
+  end
+
 end
