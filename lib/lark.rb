@@ -5,15 +5,7 @@ class LarkDBOffline < Exception ; end
 class Lark
   attr_accessor :id
 
-  def self.urls=(urls)
-    @urls = urls
-  end
-
   def self.urls
-    @urls ||= locate_urls
-  end
-
-  def self.locate_urls
     if ENV['LARK_URLS']
       ENV['LARK_URLS'].split(",")
     elsif ENV['LARK_URL']
@@ -28,10 +20,11 @@ class Lark
       puts "Connecting to #{url}";
       Redis.connect(:url => url)
     end
+    @redis_pool.push @redis_pool.shift
   end
 
-  def self.round_robin_redis
-    redis_pool.push redis_pool.shift
+  def redis_pool
+    self.class.redis_pool
   end
 
   def self.on_expired(&blk)
@@ -49,34 +42,35 @@ class Lark
     @expire = options[:expire] 
   end
 
-  def union(&blk)
+  def safe_access(&blk)
+    blk.call();
+    rescue Errno::ECONNREFUSED
+      puts "CON REFUSTED"
+    rescue Timeout::Error
+      puts "TIMEOUT"
   end
 
   def load_data
     ## try each redis - return when one works without an error
     ## throw an error if all are down
     data = nil
-    self.class.round_robin_redis.each do |redis|
-      begin
+    redis_pool.each do |redis|
+      safe_access do
         data = redis.hgetall(key)
-        break unless data.empty?
-      rescue Errno::ECONNREFUSED
-      rescue Timeout::Error
+        return data unless data.empty?
       end
     end
     raise LarkDBOffline if data.nil?
-    puts "RETURNING DATA: #{data.inspect}"
     data
   end
 
   def all_redis(&blk)
     ## try all redis - throw an error if none of them worked
+    ## return an array of all the results
     results = []
-    self.class.redis_pool.each do |redis|
-      begin
+    redis_pool.each do |redis|
+      safe_access do
         results << blk.call(redis)
-      rescue Errno::ECONNREFUSED
-      rescue Timeout::Error
       end
     end
     raise LarkDBOffline if results.empty?
@@ -92,7 +86,6 @@ class Lark
   end
 
   def set(new_data)
-    puts "SET"
     data.merge!(new_data)
     save_data
   end
@@ -111,7 +104,6 @@ class Lark
   end
 
   def data
-    puts "DATA #{@data.inspect}"
     @data ||= load_data
   end
 
@@ -134,13 +126,14 @@ class Lark
     self.class.expired.call(id, @domain);
   end
 
+  def all_ids
+    all_redis { |redis| redis.smembers(set_key) }.flatten.uniq
+  end
+
   def find_ids(match)
-    ## get memebers from all and union
-    a1 = all_redis { |redis| redis.smembers(set_key) }
-#    puts "A1: #{a1.inspect}"
-    a2 = a1.flatten.uniq.select { |_id| match.match(_id) }
-#    puts "A2: #{a2.inspect}"
-    a2
+    a = all_ids.select { |_id| match.match(_id) }
+    puts "find_ids #{a.inspect}"
+    a
   end
 
   def find_valid(match)

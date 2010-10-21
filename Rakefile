@@ -8,7 +8,7 @@ Jeweler::Tasks.new do |s|
 	s.email = "orion@heroku.com"
 	s.homepage = "http://github.com/orionz/lark"
 	s.rubyforge_project = "lark"
-	s.files = FileList["[A-Z]*", "{lib}/**/*"]
+	s.files = FileList["[A-Z]*", "{lib,spec}/**/*"]
 	s.add_dependency "redis",  [">= 2.0.5"]
 end
 
