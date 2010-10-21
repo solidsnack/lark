@@ -2,11 +2,27 @@ require 'redis'
 
 class LarkDBOffline < Exception ; end
 
-class Lark
-  attr_accessor :id
+module Lark
+#  attr_accessor :id
 
-  def self.urls
-    if ENV['LARK_URLS']
+  extend self;
+
+  def configure(options)
+    @domain = options[:domain]
+    @expire = options[:expire]
+    @urls   = options[:urls]
+  end
+
+  def domain
+    @domain.to_s
+  end
+
+  def urls
+    if @urls
+      @urls
+    elsif @url
+      [ @url ]
+    elsif ENV['LARK_URLS']
       ENV['LARK_URLS'].split(",")
     elsif ENV['LARK_URL']
       [ ENV['LARK_URL'] ]
@@ -15,11 +31,15 @@ class Lark
     end
   end
 
-  def self.dbs
+  def dbs
     @dbs ||= urls.map do |url|
       puts "Connecting to #{url}";
       Redis.connect(:url => url)
     end
+  end
+
+  def index(group)
+    "#{domain}:#{group}:idx"
   end
 
   ## all the black magic happens here
@@ -28,7 +48,7 @@ class Lark
   ## and returns an array of the block results
   ## from the ones who are online
 
-  def self.pool(&blk)
+  def pool(&blk)
     dbs.push dbs.shift
 
     num_errors = 0
@@ -48,95 +68,100 @@ class Lark
     results
   end
 
-  def self.on_expired(&blk)
+  def on_expired(&blk)
     @expired = blk;
   end
 
-  def self.expired
-    @expired
+  def index_search(group)
+    pool { |db| db.smembers(index(group)) }.flatten.uniq.sort
   end
 
-  def initialize(_id, options = {})
-    @id = _id
-    @options = options
-    @domain = options[:domain]
-    @expire = options[:expire]
+  def key(id, group)
+    "#{domain}:#{group}:key:#{id}"
   end
 
-  def load_data
+  def destroy(id, group)
+    pool do |db|
+      db.multi do
+        db.del key(id, group)
+        db.srem index(group), id
+      end
+    end
+    @expired.call(id, group) if @expired
+  end
+
+  def clean(group)
+    index_search(group).reject { |i| load_data(i, group) }.each { |i| destroy(i, group) } 
+  end
+
+  def get_all(group)
+    index_search(group).map { |i| load_data(i, group) }
+  end
+
+  def load_data(id, group)
+    key = key(id, group)
     ## try each db - return when one works without an error
     ## throw an error if all are down
     pool do |db|
       data = db.hgetall(key)
       return data if not data.empty?
     end
-    {}
+    nil
   end
 
-  def key
-    "#{@domain}:#{@id}"
-  end
+  def save_data(id, group, data)
+    key = key(id,group)
 
-  def set_key
-    "#{@domain}:lark:all"
-  end
-
-  def set(new_data)
-    data.merge!(new_data)
-    save_data
-  end
-
-  def save_data
-    data[:created_on] ||= Time.new.to_i
-    data[:domain] ||= @domain
-    data[:updated_on] = Time.new.to_i
     pool do |db|
       db.multi do
         db.hmset *[ key, data.to_a ].flatten
         db.expire key, @expire if @expire
-        db.sadd set_key, @id
+        db.sadd index(group), id
       end
     end
   end
 
-  def data
-    @data ||= load_data
+  def get(group)
+    get_all(group).select { |i| i }
   end
 
-  def destroy
-    pool do |db|
-      db.multi do
-        db.del key
-        db.srem set_key, id
-      end
+  class Base
+    attr_accessor :id, :group
+
+    def initialize(_id, _group, _data = nil)
+      @id      = _id
+      @group   = _group
+      @data    = _data
+      save_data if @data
     end
-    self.class.expired.call(id, @domain);
-  end
 
-  def all_ids
-    pool { |db| db.smembers(set_key) }.flatten.uniq.sort
-  end
+    def key
+      Lark.key(id, group)
+    end
 
-  def find_ids(match)
-    all_ids.select { |_id| match.match(_id) }
-  end
+    def set(new_data)
+      data.merge!(new_data)
+      save_data
+    end
 
-  def find_valid(match)
-    all = find_ids(match).map { |_id| Lark.new(_id, @options) }
-    valid = all.reject { |l| l.data.empty? }
-    invalid = all - valid
-    invalid.each { |i| i.destroy }
-    valid
-  end
+    def save_data
+      data[:created_on] ||= Time.new.to_i
+      data[:updated_on] = Time.new.to_i
+      data[:id] = id
+      Lark.save_data(id, group, data)
+    end
 
-  def find(match = //)
-    result = {}
-    find_valid(match).each { |v| result[v.id] = v.data }
-    result
-  end
+    def data
+      @data ||= (Lark.load_data(key) || {})
+    end
 
-  def pool(&blk)
-    self.class.pool(&blk)
-  end
+    def destroy
+      Lark.destroy(id, group)
+    end
 
+    def pool(&blk)
+      self.class.pool(&blk)
+    end
+
+  end
 end
