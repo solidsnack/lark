@@ -1,0 +1,55 @@
+
+  Lark offers reliable storage and retrieval of time-stamped records.
+
+  There is a client-side and a server-side. It is the clients and not the
+  servers that control the distributed nature of the storage system; servers
+  are decoupled from one another and dumbly store and retrieve as dictated by
+  clients.
+
+
+Log Entries vs. Records 
+-----------------------
+
+  Should Lark store records -- which can be updated -- or only log entries --
+  which are write once? Storing whole records and having an `updated_at` field
+  offers a space-savings. It would seem not to simplify client-side state
+  resolution since, one way or another, a list of results must be folded
+  together to determine the present state. Storing raw log entries is more
+  auditable, as it allows you to easily inspect recent changes posted to the
+  system. But maybe Redis makes this available already?
+
+
+Conflict Resolution
+-------------------
+
+  There doesn't seem to be any conflict resolution code in Lark. One form
+  conflict resolution could take is:
+
+    case
+    when ! conflicted?(latest_records)
+      latest_records[0]
+    when majority?
+      ( SELECT *, COUNT(1) as _count
+          FROM latest_records
+          GROUP BY being_equal
+          ORDER BY _count            )[0]
+    else
+      sort_somehow(latest_records)[0]
+    end
+
+  It is probably the case that conflicting data with the same timestamp rarely
+  if ever occurs; but the system has no way to enforce that it never happens
+  so it needs to be handled.
+
+
+Server List
+-----------
+
+  For consistent storage and retrieval of log entries, it is important that
+  all clients share the same server list. Or rather, a list that is the same
+  most of the time or mostly the same all the time. How is the list of servers
+  updated in a practical application? During the period when some nodes have
+  the new list and some have the old list, what happens? Does this set a limit
+  on how much change is allowable in the server list?
+
+
